@@ -2,107 +2,131 @@
 
 MODDIR=${0%/*}
 
-file="$MODDIR/WeiX"
-script="$MODDIR/service.sh"
+core="$MODDIR/weix"
+script="$MODDIR/boot-completed.sh"
 
-user_path="/data/user"
-pkgs_path="/data/system/packages.list"
-config_path="/data/adb/ap/package_config"
+user_dir='/data/user'
+ap_config='/data/adb/ap/package_config'
+ts_config='/data/adb/tricky_store/target.txt'
+
+get_manager() {
+  manager="$(
+    find '/data/app' -mindepth 4 -maxdepth 5 -type f -name 'libapd.so' |
+    awk -F '/' '{
+      sub(/-.*/, "", $(NF-3))
+      print $(NF-3)
+    }'
+  )"
+  [ -n "$manager" ] && return 0
+
+  manager="$(
+    dumpsys package |
+    awk -F '[][]' -v ver="$APATCH_VER_CODE" '
+      /Package \[/ {pkg = $2}
+      /codePath/ {path = $0; gsub(/ |codePath=/, "", path)}
+      $0 ~ "versionCode=" ver {print pkg, path}
+    '
+  )"
+  if [ "$(echo "$manager" | wc -l)" -eq 1 ]; then
+    manager="${manager%% *}"
+  else
+    manager="$(
+      echo "$manager" |
+      while read -r pkg path; do
+        so="$path/lib/arm64/libapd.so"
+        [ -f "$so" ] && echo "$pkg"
+      done
+    )"
+  fi
+}
 
 update_config() {
-  [ -n "$1" ] && printf "%s\n" "$1" >>"$config_path"
+  [ -n "$1" ] && echo "$1" >>"$ap_config"
 }
 
 filter_config() {
-  awk -F ',' '
-    FNR==NR {
+  get_manager
+  awk -F '[, ]' -v m="$manager" '
+    BEGIN {
+      split(m, pkg, "\n")
+      for (i in pkg) apm[pkg[i]]
+    }
+    FNR == NR {
       if (FNR==1) next
-      list[$1":"$4]
+      map[$1, $4]
       next
     }
-    {
-      split($0, i, ":")
-      if (!($0 in list) && i[1] != "me.bmax.apatch") {
-        printf "%s,1,0,%s,0,u:r:untrusted_app:s0\n", i[1], i[2]
-      }
+    ! (($1, $2) in map) && ! ($1 in apm) {
+      printf "%s,1,0,%s,0,u:r:untrusted_app:s0\n", $1, $2
     }
-  ' "$config_path" -
+  ' "$ap_config" -
 }
 
-exclude_user_app() {
+add_ap_config() {
   update_config "$(
-    find "$user_path" -mindepth 2 -maxdepth 2 -type d 2>/dev/null |
-      awk '
-      FNR == NR {
-        uid[$1] = $2
-        if ($NF != "@system") user[$1]
-        next
-      }
-      {
-        n = split($0, p, "/")
-        pkg = p[n]
-        sid = (p[n-1] == 0 ? "" : p[n-1])
-        if (pkg in user) print pkg ":" sid uid[pkg]
-      }
-    ' "$pkgs_path" - | filter_config
+    pm list packages --user all -3 -U 2>/dev/null |
+    awk -F '[: ]' '{
+      split($4, uid, ",")
+      for (i in uid) print $2, uid[i]
+    }' | filter_config
+  )"
+  [ -f "$ts_config" ] && add_ts_config
+}
+
+add_ts_config() {
+  tmp="$(mktemp)"
+  {
+    sed 's/[!?]$//' "$ts_config"
+    echo "${1:-$(
+      pm list packages -3 2>/dev/null |
+      awk -F ':' '{print $2}'
+    )}"
+  } | sort -u >"$tmp" && mv "$tmp" "$ts_config"
+}
+
+add_new_app() {
+  update_config "$(
+    pm list packages --user "${1##*/}" -3 -U "$2" 2>/dev/null |
+    awk -F '[: ]' '{print $2, $4}' | filter_config
   )"
 }
 
 monitor() {
-  ps -eo cmd | grep -qx "WeiX_${1##*/}" && exit 0
-  link="$file"_"${1##*/}"
-  ln -s "$file" "$link"
-  "$link" "$1" "$script" "${2:-0}" &
+  for pid in $(ps -eo comm,pid | awk '$1=="weix" {print $2}'); do
+    dir="$(tr '\0' ' ' <"/proc/$pid/cmdline" | awk '{print $3}')"
+    [ "$dir" = "$1" ] && return 0
+  done
+  "$core" "$script" "$1" "$2" &
 }
 
-monitor_new_app() {
-  for path in "$user_path"/*; do
+start_monitor() {
+  monitor "$user_dir" m
+  for path in "$user_dir"/*; do
     [ -d "$path" ] || continue
-    monitor "$path"
+    monitor "$path" n
   done
 }
 
-monitor_new_user() {
-  monitor "$user_path" 1
-}
-
-if [ "$1" = "install" ]; then
-  exclude_user_app
-  exit 0
-fi
-
-if [ "$#" -eq 2 ]; then
-  case "$2" in
-  '' | *[!0-9]*)
-    update_config "$(
-      awk -v sid="${1##*/}" -v pkg="$2" '
-        $1 == pkg && $NF != "@system" {
-          print $1 ":" (sid == 0 ? "" : sid) $2
-        }
-      ' "$pkgs_path" | filter_config
-    )"
+if [ "$#" -eq 3 ]; then
+  case "$1" in
+  *n*)
+    sleep 1
+    add_new_app $2 $3
+    [ "${2##*/}" -eq 0 ] && [ -f "$ts_config" ] && add_ts_config "$3"
     ;;
-  *)
-    monitor "$1/$2"
+  *m*)
+    add_new_app $3
+    monitor "$2/$3" n
     ;;
   esac
-  exit 0
+  exit
 fi
 
-while :; do
-  status=0
-  for path in "$user_path"/*; do
-    [ -d "$path" ] || continue
-    [ -d "$path/android" ] || {
-      status=1
-      break
-    }
-  done
-  [ "$status" -eq 0 ] && break
-  sleep 6
-done
+if [ "$1" = "i" ]; then
+  add_ap_config
+  exit
+fi
 
-exclude_user_app
-monitor_new_app
-monitor_new_user
-exit 0
+add_ap_config
+start_monitor
+exit

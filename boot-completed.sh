@@ -9,10 +9,45 @@ user_dir='/data/user'
 ap_config='/data/adb/ap/package_config'
 ts_config='/data/adb/tricky_store/target.txt'
 
+get_ap_config() {
+  ap_config="$(
+    find '/data/adb' -mindepth 2 -maxdepth 2 -type f -name 'package_config'
+  )"
+  [ "$(echo "$ap_config" | wc -l)" -eq 1 ] && return 0
+
+  ap_config="$(
+    echo "$ap_config" |
+      while read -r path; do
+        [ -f "${path%/*}/bin/busybox" ] && echo "$path"
+      done
+  )"
+  [ "$(echo "$ap_config" | wc -l)" -eq 1 ] && return 0
+
+  ap_config="$(
+    echo "$(
+      echo "$ap_config" |
+        while read -r v; do
+          stat -c '%Y %n' "$v"
+        done
+    )" |
+      awk '
+      $1 > max {
+        max = $1
+        file = $2
+      }
+      END {
+        print file
+      }
+    '
+  )"
+
+  [ -z "$ap_config" ] && exit
+}
+
 get_manager() {
   manager="$(
     find '/data/app' -mindepth 4 -maxdepth 5 -type f -name 'libapd.so' |
-    awk -F '/' '{
+      awk -F '/' '{
       sub(/-.*/, "", $(NF-3))
       print $(NF-3)
     }'
@@ -21,7 +56,7 @@ get_manager() {
 
   manager="$(
     dumpsys package |
-    awk -F '[][]' -v ver="$APATCH_VER_CODE" '
+      awk -F '[][]' -v ver="$APATCH_VER_CODE" '
       /Package \[/ {pkg = $2}
       /codePath/ {path = $0; gsub(/ |codePath=/, "", path)}
       $0 ~ "versionCode=" ver {print pkg, path}
@@ -32,20 +67,22 @@ get_manager() {
   else
     manager="$(
       echo "$manager" |
-      while read -r pkg path; do
-        so="$path/lib/arm64/libapd.so"
-        [ -f "$so" ] && echo "$pkg"
-      done
+        while read -r pkg path; do
+          so="$path/lib/arm64/libapd.so"
+          [ -f "$so" ] && echo "$pkg"
+        done
     )"
   fi
 }
 
 update_config() {
+  [ -f "$ap_config" ] || get_ap_config
   [ -n "$1" ] && echo "$1" >>"$ap_config"
 }
 
 filter_config() {
-  get_manager
+  [ -f "$ap_config" ] || get_ap_config
+  [ -n "$manager" ] || get_manager
   awk -F '[, ]' -v m="$manager" '
     BEGIN {
       split(m, pkg, "\n")
@@ -65,7 +102,7 @@ filter_config() {
 add_ap_config() {
   update_config "$(
     pm list packages --user all -3 -U 2>/dev/null |
-    awk -F '[: ]' '{
+      awk -F '[: ]' '{
       split($4, uid, ",")
       for (i in uid) print $2, uid[i]
     }' | filter_config
@@ -75,19 +112,55 @@ add_ap_config() {
 
 add_ts_config() {
   tmp="$(mktemp)"
+  tsc_status="$([ -s "$ts_config" ] && echo 1 || echo 0)"
   {
-    sed 's/[!?]$//' "$ts_config"
     echo "${1:-$(
-      pm list packages -3 2>/dev/null |
-      awk -F ':' '{print $2}'
+      base_pkg="
+        com.android.vending
+        com.google.android.gms
+        com.google.android.gsf
+        com.heytap.speechassist
+        com.coloros.sceneservice
+        com.oplus.deepthinker
+      "
+      echo "$(
+        pm list packages -s 2>/dev/null |
+          awk -F ':' -v base="$(echo "$base_pkg" | tr '\n' '|')" '
+          BEGIN {
+            split(base, pkg, "|")
+            for (i in pkg) {
+              sub(/ +/, "", pkg[i])
+              if (pkg[i] != "") map[pkg[i]]
+            }
+          }
+          $2 in map {
+            print ":"$2
+          }
+        '
+      )"
+      pm list packages -3 2>/dev/null
     )}"
-  } | sort -u >"$tmp" && mv "$tmp" "$ts_config"
+  } |
+    awk -F ':' -v tsc_stat="$tsc_status" '
+    FNR == NR && tsc_stat == 1 {
+      line = pkg = $0
+      sub(/[\r!?]+$/, "", pkg)
+      if (pkg != "") map[pkg] = line
+      next
+    }
+    !($2 in map) {
+      map[$2] = $2
+    }
+    END {
+      for (pkg in map) print map[pkg]
+    }
+  ' "$ts_config" - | sort >"$tmp" && mv "$tmp" "$ts_config"
 }
 
 add_new_app() {
   update_config "$(
     pm list packages --user "${1##*/}" -3 -U "$2" 2>/dev/null |
-    awk -F '[: ]' '{print $2, $4}' | filter_config
+      awk -F '[: ]' '{print $2, $4}' | filter_config
   )"
 }
 
@@ -108,11 +181,11 @@ start_monitor() {
 }
 
 if [ "$#" -eq 3 ]; then
+  sleep 1
   case "$1" in
   *n*)
-    sleep 1
     add_new_app $2 $3
-    [ "${2##*/}" -eq 0 ] && [ -f "$ts_config" ] && add_ts_config "$3"
+    [ "${2##*/}" -eq 0 ] && [ -f "$ts_config" ] && add_ts_config ":$3"
     ;;
   *m*)
     add_new_app $3
